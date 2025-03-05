@@ -1,8 +1,11 @@
 use actix_web::{web, HttpResponse, Error};
+use actix_multipart::Multipart;
 use mongodb::{bson::{doc, oid::ObjectId}, Collection};
 use futures::TryStreamExt;
 use tracing::{info, error, debug};
-use crate::{config::MongoConfig, models::{Product, CreateProductRequest, UpdateProductRequest}};
+use futures_util::StreamExt;
+use std::io::Write;
+use crate::{config::MongoConfig, models::{Product, CreateProductRequest, UpdateProductRequest, Category}};
 
 pub async fn create_product(
     db: web::Data<MongoConfig>,
@@ -155,5 +158,218 @@ pub async fn delete_product(
     } else {
         info!("Product deleted successfully: {}", id);
         Ok(HttpResponse::Ok().finish())
+    }
+}
+
+use csv::ReaderBuilder;
+use tempfile::NamedTempFile;
+
+pub async fn upload_products_csv(
+    db: web::Data<MongoConfig>,
+    mut payload: Multipart,
+) -> Result<HttpResponse, Error> {
+    let collection: Collection<Product> = db.database.collection("products");
+    let mut errors = Vec::new();
+    let mut success_count = 0;
+
+    // Process the multipart form data
+    while let Some(item) = payload.next().await {
+        let mut field = item.map_err(|e| {
+            error!("Error getting multipart field: {}", e);
+            actix_web::error::ErrorBadRequest(format!("Multipart error: {}", e))
+        })?;
+
+        if field.name() == "file" {
+            // Create a temporary file to store the CSV data
+            let mut temp_file = NamedTempFile::new().map_err(|e| {
+                error!("Failed to create temp file: {}", e);
+                actix_web::error::ErrorInternalServerError("Failed to process file")
+            })?;
+
+            // Write the field data to the temp file
+            while let Some(chunk) = field.next().await {
+                let data = chunk.map_err(|e| {
+                    error!("Error reading multipart chunk: {}", e);
+                    actix_web::error::ErrorBadRequest("Failed to read uploaded file")
+                })?;
+                temp_file.write_all(&data).map_err(|e| {
+                    error!("Failed to write to temp file: {}", e);
+                    actix_web::error::ErrorInternalServerError("Failed to process file")
+                })?;
+            }
+
+            // Create a CSV reader
+            let mut rdr = ReaderBuilder::new()
+                .flexible(true)
+                .trim(csv::Trim::All)
+                .from_reader(temp_file.reopen().map_err(|e| {
+                    error!("Failed to reopen temp file: {}", e);
+                    actix_web::error::ErrorInternalServerError("Failed to process file")
+                })?);
+
+            let mut line_number = 2; // Start from 2 to account for header row
+            for result in rdr.records() {
+                match result {
+                    Ok(record) => {
+                        let mut has_error = false;
+
+                        if record.len() < 4 {
+                            errors.push(doc! {
+                                "line": line_number,
+                                "error": "Invalid number of columns",
+                                "data": record.iter().collect::<Vec<_>>()
+                            });
+                            has_error = true;
+                        }
+
+                        // Parse the CSV record - safely get values or use empty strings
+                        let raw_name = record.get(0).unwrap_or("").trim();
+
+                        // Split the name into product name and ID parts
+                        let (product_name, product_id) = if let Some((name, id)) = raw_name.split_once("#") {
+                            (name.trim(), id.trim())
+                        } else {
+                            (raw_name, "")
+                        };
+
+                        // Validate and sanitize product ID
+                        let sanitized_id = if !product_id.is_empty() {
+                            // Remove any surrounding parentheses
+                            let id_content = product_id.trim_start_matches('(').trim_end_matches(')');
+
+                            // Only allow alphanumeric and basic symbols in ID
+                            let clean_id = id_content
+                                .chars()
+                                .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+                                .collect::<String>();
+
+                            if clean_id.is_empty() {
+                                String::new()
+                            } else {
+                                format!("#{}", clean_id)
+                            }
+                        } else {
+                            String::new()
+                        };
+
+                        // Sanitize product name
+                        let clean_name = product_name
+                            .chars()
+                            .filter(|c| c.is_alphanumeric() || c.is_whitespace() || *c == '-')
+                            .collect::<String>()
+                            .trim()
+                            .to_string();
+
+                        let price_str = record.get(1).unwrap_or("").trim();
+                        let category_str = record.get(2).unwrap_or("").trim().to_lowercase();
+                        let has_active_sale = record.get(3).unwrap_or("false").trim().parse::<bool>();
+
+                        // Validate name
+                        if clean_name.is_empty() {
+                            errors.push(doc! {
+                                "line": line_number,
+                                "error": "Name is required",
+                                "data": record.iter().collect::<Vec<_>>()
+                            });
+                            has_error = true;
+                        }
+
+                        // Parse and validate price
+                        let price = if price_str.is_empty() {
+                            errors.push(doc! {
+                                "line": line_number,
+                                "error": "Price is required",
+                                "data": record.iter().collect::<Vec<_>>()
+                            });
+                            has_error = true;
+                            0.0
+                        } else {
+                            // Remove '$', whitespace, and any hidden characters
+                            let cleaned_price = price_str
+                                .trim_start_matches('$')
+                                .trim()
+                                .replace(['\u{200B}', '\u{FEFF}', '\r', '\n'], ""); // Remove zero-width spaces, BOM, and line endings
+
+                            match cleaned_price.parse::<f64>() {
+                                Ok(p) if p >= 0.0 => p,
+                                Ok(p) => {
+                                    errors.push(doc! {
+                                        "line": line_number,
+                                        "error": format!("Invalid price: must be non-negative, got: '{}'", p),
+                                        "data": record.iter().collect::<Vec<_>>()
+                                    });
+                                    has_error = true;
+                                    0.0
+                                },
+                                Err(e) => {
+                                    errors.push(doc! {
+                                        "line": line_number,
+                                        "error": format!("Invalid price format. Expected format: $X.XX, got: '{}'. Parse error: {}", price_str, e),
+                                        "data": record.iter().collect::<Vec<_>>()
+                                    });
+                                    has_error = true;
+                                    0.0
+                                }
+                            }
+                        };
+
+                        let category = match category_str.as_str() {
+                            "electronics" => Category::Electronics,
+                            "clothing" => Category::Clothing,
+                            "food" => Category::Food,
+                            "books" => Category::Books,
+                            _ => Category::Other,
+                        };
+
+                        let has_active_sale = has_active_sale.unwrap_or(false);
+
+                        // Only proceed with insertion if there are no errors for this record
+                        if !has_error {
+                            let product = Product {
+                                id: None,
+                                name: format!("{} {}", clean_name.clone(), sanitized_id).to_string(),
+                                price,
+                                category,
+                                has_active_sale,
+                            };
+
+                            // Insert the product into the database
+                            match collection.insert_one(product, None).await {
+                                Ok(_) => success_count += 1,
+                                Err(e) => {
+                                    error!("Failed to insert product at line {}: {}", line_number, e);
+                                    errors.push(doc! {
+                                        "line": line_number,
+                                        "error": format!("Database error: {}", e),
+                                        "data": record.iter().collect::<Vec<_>>()
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Error reading CSV record at line {}: {}", line_number, e);
+                        errors.push(doc! {
+                            "line": line_number,
+                            "error": format!("Failed to parse CSV record: {}", e),
+                        });
+                    }
+                }
+                line_number += 1;
+            }
+        }
+    }
+
+    // Return response with results
+    if errors.is_empty() {
+        debug!("Successfully imported {} products", success_count);
+        Ok(HttpResponse::Ok().json(doc! {
+            "message": format!("Successfully imported {} products", success_count)
+        }))
+    } else {
+        debug!("Found {} errors while importing products", errors.len());
+        Ok(HttpResponse::UnprocessableEntity().json(doc! {
+            "errors": errors
+        }))
     }
 }

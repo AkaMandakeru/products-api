@@ -1,0 +1,4 @@
+name,price,category,has_active_sale
+Test Product 1,29.99,electronics,true
+Test Product 2,19.99,clothing,false
+Test Product 3,9.99,food,true

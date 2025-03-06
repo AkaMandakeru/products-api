@@ -1,11 +1,35 @@
 use actix_web::{web, HttpResponse, Error};
 use actix_multipart::Multipart;
-use mongodb::{bson::{doc, oid::ObjectId}, Collection};
+use mongodb::{
+    bson::{doc, oid::ObjectId, Document},
+    options::FindOptions,
+    Collection,
+};
 use futures::TryStreamExt;
 use tracing::{info, error, debug};
+use serde::{Deserialize, Serialize};
+use csv::ReaderBuilder;
+use tempfile::NamedTempFile;
+use regex::escape;
 use futures_util::StreamExt;
 use std::io::Write;
 use crate::{config::MongoConfig, models::{Product, CreateProductRequest, UpdateProductRequest, Category}};
+
+#[derive(Debug, Deserialize)]
+pub struct ListProductsQuery {
+    page: Option<i64>,
+    per_page: Option<i64>,
+    filter: Option<String>,
+    price: Option<f64>,
+    sort: Option<String>,
+    direction: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListProductsResponse {
+    products: Vec<Product>,
+    total_pages: i64,
+}
 
 pub async fn create_product(
     db: web::Data<MongoConfig>,
@@ -65,13 +89,58 @@ pub async fn get_product(
 
 pub async fn list_products(
     db: web::Data<MongoConfig>,
+    query: web::Query<ListProductsQuery>,
 ) -> Result<HttpResponse, Error> {
     let collection: Collection<Product> = db.database.collection("products");
 
-    debug!("Fetching products");
+    // Set up pagination
+    let per_page = query.per_page.unwrap_or(15);
+    let page = query.page.unwrap_or(1).max(1);
+    let skip = (page - 1) * per_page;
 
+    // Build filter
+    let mut filter = Document::new();
+    if let Some(name_filter) = &query.filter {
+        filter.insert("name", doc! {
+            "$regex": format!("(?i){}", escape(name_filter))
+        });
+    }
+    if let Some(price) = query.price {
+        filter.insert("price", price);
+    }
+
+    // Build sort
+    let allowed_sort_columns = ["name", "price"];
+    let sort_column = query.sort
+        .as_deref()
+        .filter(|&s| allowed_sort_columns.contains(&s))
+        .unwrap_or("name");
+
+    let sort_direction = match query.direction.as_deref() {
+        Some("desc") => -1,
+        _ => 1,
+    };
+
+    let sort_doc = doc! { sort_column: sort_direction };
+
+    // Set up options with sort and pagination
+    let find_options = FindOptions::builder()
+        .sort(sort_doc)
+        .skip(skip as u64)
+        .limit(per_page as i64)
+        .build();
+
+    // Get total count for pagination
+    let total_count = collection.count_documents(filter.clone(), None).await.map_err(|e| {
+        error!("Failed to count products: {}", e);
+        actix_web::error::ErrorInternalServerError(format!("Database error: {}", e))
+    })?;
+
+    let total_pages = ((total_count as f64) / (per_page as f64)).ceil() as i64;
+
+    // Fetch products
     let mut products = Vec::new();
-    let mut cursor = collection.find(None, None).await.map_err(|e| {
+    let mut cursor = collection.find(filter, find_options).await.map_err(|e| {
         error!("Failed to fetch products: {}", e);
         actix_web::error::ErrorInternalServerError(format!("Database error: {}", e))
     })?;
@@ -83,8 +152,12 @@ pub async fn list_products(
         products.push(result);
     }
 
-    info!("Retrieved {} products", products.len());
-    Ok(HttpResponse::Ok().json(products))
+    info!("Retrieved {} products (page {} of {})", products.len(), page, total_pages);
+
+    Ok(HttpResponse::Ok().json(ListProductsResponse {
+        products,
+        total_pages,
+    }))
 }
 
 pub async fn update_product(
@@ -160,9 +233,6 @@ pub async fn delete_product(
         Ok(HttpResponse::Ok().finish())
     }
 }
-
-use csv::ReaderBuilder;
-use tempfile::NamedTempFile;
 
 pub async fn upload_products_csv(
     db: web::Data<MongoConfig>,

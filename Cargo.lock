@@ -1581,6 +1581,7 @@ dependencies = [
  "futures",
  "futures-util",
  "mongodb",
+ "regex",
  "serde",
  "tempfile",
  "tokio",

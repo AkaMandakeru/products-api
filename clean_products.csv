@@ -1,0 +1,11 @@
+name,price,category,has_active_sale
+Gaming Laptop,1299.99,electronics,true
+Running Shoes,89.99,clothing,false
+Fresh Apples,4.99,food,true
+Programming Book,49.99,books,false
+Smart Watch,199.99,electronics,true
+T-Shirt,19.99,clothing,true
+Chocolate Bar,2.99,food,false
+Mystery Novel,14.99,books,true
+Wireless Earbuds,129.99,electronics,false
+Jeans,59.99,clothing,true
